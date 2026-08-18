@@ -19,19 +19,12 @@
 return {
   name: 'side-session',
   inject: ['slots', 'timer'],
-  async apply(ctx) {
-    // Reuse the main session's Markdown renderer (GFM + KaTeX + code blocks +
-    // copy buttons) through the browser module loader — dynamic packages
-    // cannot `require`, but the loader can materialize registered bundles.
-    let MarkdownText = null
-    try {
-      const primitives = await window.__ModuleLoader__.import('@deepseek-ai/dsh-client-ui-primitives')
-      if (primitives !== null && typeof primitives === 'object' && typeof primitives.MarkdownText === 'object') {
-        MarkdownText = primitives.MarkdownText
-      }
-    } catch (error) {
-      console.error('side-session: primitives import failed, falling back to built-in markdown:', error)
-    }
+  apply(ctx) {
+    // Markdown is rendered by the built-in renderer below (renderInline /
+    // renderMarkdown). Dynamic packages cannot `require` and the browser
+    // module loader only registers factories, so the main session's
+    // MarkdownText component is not reachable from here; the renderer
+    // mirrors its look with the same theme tokens.
     const sessions = ctx.get('sessions')
     const slots = ctx.get('slots')
     if (slots === undefined || sessions === undefined) return
@@ -505,11 +498,7 @@ return {
         React.createElement(
           'div',
           { className: 'ss-assistant-body' },
-          body.map((text, idx) =>
-            MarkdownText !== null
-              ? React.createElement(MarkdownText, { key: idx, text, streaming: running, codeLabels })
-              : React.createElement(React.Fragment, { key: idx }, renderMarkdown(text, `md-${idx}`))
-          )
+          body.map((text, idx) => React.createElement(React.Fragment, { key: idx }, renderMarkdown(text, `md-${idx}`)))
         )
       )
     }

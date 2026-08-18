@@ -185,7 +185,7 @@ return {
               role: 'user',
               content: [{ type: 'text', text: boundaryText }],
               source: { kind: 'plugin', plugin: 'side-session' }
-            })
+            }, { surfaceOp: 'append' })
             // Side-conversation identity section as a second line of defense.
             childCtx.systemPrompt.section({
               name: 'side-session:identity',

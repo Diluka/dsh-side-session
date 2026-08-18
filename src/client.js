@@ -754,9 +754,9 @@ return {
         {
           onClick: open,
           disabled: busy || sideOpen !== null || mainId === undefined,
-          title: sideOpen !== null ? '侧边会话已打开' : '打开侧边临时会话（fork 当前会话）'
+          title: busy ? '正在创建…' : (sideOpen !== null ? '侧边会话已打开' : '打开侧边临时会话（fork 当前会话）')
         },
-        busy ? '…' : '侧边会话'
+        '侧边会话'
       )
     }
 

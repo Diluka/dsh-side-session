@@ -22,18 +22,18 @@ return {
     const slots = ctx.get('slots')
     if (slots === undefined || sessions === undefined) return
 
-    /** The currently open side session id (null = closed). */
-    let sideSessionId = null
+    /** The currently open side session: id plus the fork-seed boundary. */
+    let sideState = null
     const listeners = new Set()
     const subscribeSide = (fn) => {
       listeners.add(fn)
       return () => listeners.delete(fn)
     }
-    const setSide = (id) => {
-      sideSessionId = id
+    const setSide = (state) => {
+      sideState = state
       for (const fn of [...listeners]) fn()
     }
-    const getSide = () => sideSessionId
+    const getSide = () => sideState
 
     styles.insert(`
 .side-session-overlay {
@@ -212,7 +212,9 @@ return {
 
     /** The floating side-session panel (shell.overlay occupant). */
     function SidePanel() {
-      const sessionId = React.useSyncExternalStore(subscribeSide, getSide)
+      const state = React.useSyncExternalStore(subscribeSide, getSide)
+      const sessionId = state === null ? null : state.sessionId
+      const seedLength = state === null ? null : state.seedLength
       const { session, snapshot } = useSideSession(sessionId)
       const [draft, setDraft] = React.useState('')
       const [sending, setSending] = React.useState(false)
@@ -251,9 +253,11 @@ return {
           console.error('side-session close failed:', error)
         }
       }
-
       const rows = nodes
         .map((node, index) => {
+          // Forked history stays invisible: only nodes after the seed
+          // boundary belong to this side session's own conversation.
+          if (typeof node.seq === 'number' && seedLength !== null && node.seq < seedLength) return null
           if (node.kind === 'user') {
             const text = textOfContent(node.content)
             if (text === '') return null
@@ -330,7 +334,7 @@ return {
         try {
           const result = await host.call('side-session/create', { sourceId: mainId })
           if (result !== null && result.ok === true && typeof result.sessionId === 'string') {
-            setSide(result.sessionId)
+            setSide({ sessionId: result.sessionId, seedLength: typeof result.seedLength === 'number' ? result.seedLength : null })
           } else {
             console.error('side-session create failed:', result)
           }

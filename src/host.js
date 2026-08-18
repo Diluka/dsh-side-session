@@ -88,7 +88,11 @@ return {
           meta: {
             ...(parentHeader.cwd !== undefined ? { cwd: parentHeader.cwd } : {}),
             ...(agentPreset !== undefined ? { agentPreset } : {}),
-            parentSession: parentHeader.id,
+            // Deliberately NO parentSession: with origin 'subagent' a parent
+            // link would surface this session in the parent's subagent
+            // catalog (and its "N subagents" badge), interfering with the
+            // main session. Fork lineage lives in seedLength + the injected
+            // identity prompt instead.
             origin: 'subagent',
             ...(seed.length > 0 ? { seedLength: seed.length } : {})
           },
@@ -111,7 +115,7 @@ return {
         return { ok: false, code: 'create-failed', message: error instanceof Error ? error.message : String(error) }
       }
       handles.set(childId, handle)
-      return { ok: true, sessionId: childId }
+      return { ok: true, sessionId: childId, seedLength: seed.length }
     })
 
     /** Dispose a side session: the agent is destroyed, the session leaves the store. */

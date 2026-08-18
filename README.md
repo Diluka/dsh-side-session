@@ -72,11 +72,12 @@ dsh plugin --profile web add github:你的名字/dsh-side-session
 ## 文件
 
 - `lib/index.js` — Host 半部（零依赖）：fork + 近期上下文快照 + boundary 消息注入，创建 / 发送 / 停止 / 关闭 / 列出侧边会话；webServer JSON 路由。
+- `lib/index.js` — Host 半部（零依赖）：fork + 近期上下文快照 + boundary 消息注入，创建 / 发送 / 停止 / 关闭 / 列出侧边会话；webServer JSON 路由。
 - `lib/client.js` — Client 半部（ModuleLoader bundle）：头部按钮 + 浮动面板 UI，助手消息复用主会话 MarkdownText。
-- `package.json` — `dsh.bundle.patch`（layer patch）、`dsh.client`（web 平台声明）、peerDependencies（仅类型参考，运行时零依赖）。
+- `package.json` — `dsh.bundle.patch`（layer patch）、`dsh.client`（web 平台声明）、peerDependencies（运行时契约文档，代码本身零依赖）。
 - `cordis.patch.yml` — bundle patch：把插件行插入 profile 的 layer stack。
 - `dsh.plugin.json` — 插件清单（元数据）。
-- `src/` — 早期动态插件版本（Typert Remote RPC），仅历史参考，不再使用。
+- `LICENSE` — MIT。
 
 ## License
 

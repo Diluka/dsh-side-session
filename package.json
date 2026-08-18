@@ -45,9 +45,8 @@
   "keywords": [
     "dsh",
     "deepseek-harness",
+    "dsh-plugin",
     "side-session",
-    "codex",
-    "btw",
     "plugin"
   ],
   "license": "MIT"

@@ -89,11 +89,14 @@ return {
      * session forks stale history. Reading the live log directly is not
      * subject to that replay constraint: user messages, finished assistant
      * messages, and tool calls inside the in-flight turn are all committed
-     * events, so this snapshot is current.
+     * events, so this snapshot is current. Only events at/after `fromSeq`
+     * (the fork boundary) are included, so the snapshot completes the fork
+     * without duplicating it.
      */
-    function recentMainContext(parent, maxChars = 6000) {
+    function recentMainContext(parent, fromSeq = 0, maxChars = 6000) {
       const parts = []
       for (const e of parent.session.events) {
+        if (e.seq < fromSeq) continue
         if (e.type === 'user/message') {
           const data = e.data
           const text = Array.isArray(data?.content)
@@ -143,7 +146,7 @@ return {
       const agentPresets = ctx.get('agentPresets')
       const agentPreset = agentPresets?.composedPreset(parent.ctx)
       const policies = captureParentPolicies(parent)
-      const context = recentMainContext(parent)
+      const context = recentMainContext(parent, seed.length)
       let handle
       try {
         handle = await ctx.agents.create({

@@ -19,49 +19,64 @@
 
 解决：`recentMainContext()` 直接读主会话的**内存日志**——不受重放约束，当前进行中轮次里已提交的事件（用户消息、助手消息、工具调用）全部可见——取 fork 边界之后的最新活动，随 boundary 消息注入。侧边会话因此**既知道历史，也知道主会话此刻在干什么**。
 
+## 为什么延迟初始化
+
+点击按钮**立即**弹出面板（不等待任何创建过程）；fork + 子 agent 的创建发生在**首条消息发送时**。打开但未使用不会产生任何会话。
+
 ## 架构
 
 ```
 ┌─────────────────────────── Host（DSH 进程）───────────────────────────┐
-│ src/host.js                                                           │
-│  harness.handle('side-session/create')  → fork seed + 近期上下文快照   │
-│                                           + boundary 消息 + 子 agent   │
-│  harness.handle('side-session/prompt')  → agent.followup（host 内驱动）│
-│  harness.handle('side-session/cancel')  → agent.cancel                │
-│  harness.handle('side-session/close')   → dispose agent + 删除落盘文件 │
+│ lib/index.js（零依赖 ESM，不 import 任何 @deepseek-ai/*）             │
+│  webServer 路由 POST /side-session/api/<method>                       │
+│   create → fork seed + 近期上下文快照 + boundary 消息 + 子 agent       │
+│   prompt → agent.followup（host 内驱动）                              │
+│   cancel → agent.cancel                                               │
+│   close  → dispose agent + 删除落盘文件                               │
+│   list / status                                                       │
 └───────────────────────────────────────────────────────────────────────┘
 ┌────────────────────────── Client（浏览器）────────────────────────────┐
-│ src/client.js                                                         │
+│ lib/client.js（ModuleLoader bundle，/plugins/@dsh-external/...）      │
 │  conversation.session.header.actions  「侧边会话」按钮                 │
 │  shell.overlay                       浮动侧边面板                     │
-│    用户气泡（主会话样式 token）、助手消息（markdown 渲染：代码块/      │
-│    表格/列表/行内格式）、思考折叠、工具调用 chip、运行状态、错误显示    │
+│    助手消息复用主会话的 MarkdownText（GFM/KaTeX/代码块/复制按钮）、    │
+│    思考折叠、工具调用 chip、运行状态、错误显示                         │
+│  RPC：fetch POST /side-session/api/<method>                           │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
-- Host/Client 通过 Package-private RPC（`harness.handle` ↔ `host.call`）通信。
+- Host/Client 通过 webServer JSON 路由通信（与 `dsh-balance-plugin` 等 profile 插件相同的零依赖范式：profile bundle 只能解析 profile 自己的 node_modules，不能 import `@deepseek-ai/*`）。
 - 面板复用标准 `sessions` 服务：`binding(sessionId)` 绑定会话、`session.subscribe()/getSnapshot()` 渲染消息流；fork 历史与 boundary 消息在渲染时过滤（`seq < seedLength`、`source.plugin === 'side-session'`）。
 - 消息发送不走 wire 的 `session.prompt`（它会拒绝 `origin: 'subagent'` 的会话），由 host 半部直接 `agent.followup()`。
+
+## 安装
+
+静态 profile 插件，纯 JS 无构建步骤，支持本地路径 / tarball / GitHub 安装：
+
+```bash
+# 本地路径（仓库或 tarball 均可，效果等价）
+dsh plugin --profile web add /path/to/dsh-side-session
+# 或 GitHub（若发布到公开仓库）
+dsh plugin --profile web add github:你的名字/dsh-side-session
+```
+
+`dsh plugin add` 会把它写入 profile 的 `package.json`（`dsh.profile.bundles` 自动追加，patch 机制生效）。**重启 dsh web 后生效**。
 
 ## 使用
 
 1. 打开 DSH Web 界面并进入任意会话。
-2. 会话头部点击「侧边会话」→ 右侧打开侧边临时会话窗口（已 fork 主会话历史 + 带入最新动态）。
+2. 会话头部点击「侧边会话」→ 右侧立即打开侧边临时会话窗口（fork 与 agent 创建延迟到首条消息）。
 3. 在窗口中提问，代理将以与主会话相同的目录 / 工具 / 技能 / 权限工作，遵守 boundary 提示词（历史仅供参考、非破坏性探索、不干扰主线程）。
 4. 点击「关闭」→ 侧边会话被销毁并删除落盘记录，无法再次打开。
 
-## 开发与验证
-
-仓库源码（`src/host.js`、`src/client.js`）即动态 Cordis 插件的 `code.host` / `code.client` 函数体，可直接用于 DSH 的动态插件机制验证：
-
-1. 用 `cordis_define` 定义插件（`kind: 'new'`，`idPrefix: 'side'`，分别粘贴 `src/host.js` 与 `src/client.js` 的内容）。
-2. `cordis_run` 激活；在页面会话头部出现「侧边会话」按钮即加载成功。
-
 ## 文件
 
-- `src/host.js` — Host 半部：fork + 近期上下文快照 + boundary 消息注入，创建 / 发送 / 停止 / 关闭 / 列出侧边会话。
-- `src/client.js` — Client 半部：头部按钮 + 浮动面板 UI（markdown 渲染、思考折叠、工具 chip、运行状态）。
-- `plugin.json` — 插件清单（元数据）。
+- `lib/index.js` — Host 半部（零依赖）：fork + 近期上下文快照 + boundary 消息注入，创建 / 发送 / 停止 / 关闭 / 列出侧边会话；webServer JSON 路由。
+- `lib/client.js` — Client 半部（ModuleLoader bundle）：头部按钮 + 浮动面板 UI，助手消息复用主会话 MarkdownText。
+- `package.json` — `dsh.bundle.patch`（layer patch）、`dsh.client`（web 平台声明）、peerDependencies（仅类型参考，运行时零依赖）。
+- `cordis.patch.yml` — bundle patch：把插件行插入 profile 的 layer stack。
+- `dsh.plugin.json` — 插件清单（元数据）。
+- `src/` — 早期动态插件版本（Typert Remote RPC），仅历史参考，不再使用。
 
 ## License
 

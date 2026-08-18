@@ -4,12 +4,11 @@
  * Creates a "side temporary session" (Claude Code /btw-style) from the
  * current main session:
  *
- *   1. fresh + current: NO event seed is inherited (a completed-turn fork of
- *      a running main session is stale by definition), but the parent's
- *      RECENT activity — user messages, finished assistant messages, tool
- *      calls — is extracted from the live log and injected as reference
- *      context, so the side session knows what the main session is doing
- *      right now;
+ *   1. fork + completion: the child is seeded with the parent's COMPLETED-turn
+ *      history (reference context), and the parent's RECENT activity — user
+ *      messages, finished assistant messages, tool calls from the live log,
+ *      including the in-flight turn — is injected on top, so the side session
+ *      sees both the history and what the main session is doing right now;
  *   2. same agent: join the parent's agent preset (tools / skills / prompt /
  *      permission composition), inherit cwd, model route, and sandbox/approval
  *      overrides;
@@ -59,9 +58,16 @@ return {
       ].join('\n')
     }
 
+    /** Fork seed: the parent log prefix through its last completed turn. */
+    function completedTurnPrefix(parent) {
+      const events = parent.session.events
+      const lastEnd = events.findLast((e) => e.type === 'turn/end')
+      if (lastEnd === undefined) return []
+      return events.slice(0, lastEnd.seq + 1)
+    }
+
     /** Capture the parent's explicit policy overrides (keeps permissions aligned). */
-    function captureParentPolicies(parent) {
-      return {
+    function captureParentPolicies(parent) {      return {
         sandboxMode: ctx.get('sandboxPolicy')?.overrideOf(parent.session),
         approvalPolicy: ctx.get('approval')?.overrideOf(parent.session)
       }
@@ -124,13 +130,14 @@ return {
       return tail.join('\n')
     }
 
-    /** Create a side session from `sourceId` (recent-context reference). */
+    /** Create a side session from `sourceId` (fork + recent-context completion). */
     harness.handle('side-session/create', async (args) => {
       const sourceId = String(args?.sourceId ?? '')
       const parent = ctx.agents.get(sourceId)
       if (parent === undefined) {
         return { ok: false, code: 'unknown-source', message: `unknown source session "${sourceId}"` }
       }
+      const seed = completedTurnPrefix(parent)
       const childId = 'side-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
       const parentHeader = parent.session.header
       const agentPresets = ctx.get('agentPresets')
@@ -144,11 +151,12 @@ return {
           meta: {
             ...(parentHeader.cwd !== undefined ? { cwd: parentHeader.cwd } : {}),
             ...(agentPreset !== undefined ? { agentPreset } : {}),
-            // NO parentSession (avoids the subagent catalog), NO event seed
-            // (a completed-turn fork of a running session is stale) — context
-            // travels as the injected boundary message instead.
-            origin: 'subagent'
+            // NO parentSession (avoids the subagent catalog). Fork lineage
+            // lives in seedLength + the injected boundary message.
+            origin: 'subagent',
+            ...(seed.length > 0 ? { seedLength: seed.length } : {})
           },
+          ...(seed.length > 0 ? { seed } : {}),
           // Inherit the parent's model route: the persona section references
           // {{model}}/{{provider}} variables, which fail assembly when unset.
           agentOptions: {
@@ -163,13 +171,15 @@ return {
             // Same sandbox + approval overrides as the parent session.
             appendPolicies(childCtx.agent.session, policies)
             // Boundary + the parent's RECENT activity as the first user
-            // message: inherited context is reference only, the snapshot is
-            // current (unlike a fork seed), and everything after this message
-            // is the active task. The client hides this row via its
-            // `plugin: side-session` source.
+            // message. The forked history ends at the last completed turn and
+            // can be stale for a running main session, so the live-log
+            // snapshot (user messages / assistant messages / tool calls,
+            // including the in-flight turn's committed events) completes it.
+            // Everything after this message is the active task; the client
+            // hides this row via its `plugin: side-session` source.
             const boundaryText =
               sideSessionPrompt(parentHeader.id) +
-              (context === '' ? '' : `\n\n【主会话近期上下文（仅参考，勿执行）】\n${context}`)
+              (context === '' ? '' : `\n\n【主会话近期上下文（补全 fork 历史，仅参考，勿执行）】\n${context}`)
             childCtx.agent.session.append('user/message', {
               id: 'side-boundary-' + childId,
               role: 'user',
@@ -188,7 +198,7 @@ return {
         return { ok: false, code: 'create-failed', message: error instanceof Error ? error.message : String(error) }
       }
       handles.set(childId, handle)
-      return { ok: true, sessionId: childId }
+      return { ok: true, sessionId: childId, seedLength: seed.length }
     })
 
     /** Dispose a side session: the agent is destroyed, the session leaves the store. */

@@ -697,7 +697,7 @@ return {
             ? React.createElement(
                 'div',
                 { className: 'ss-empty' },
-                '侧边临时会话已就绪\n继承主会话已完成的上下文，仅作参考\n在这里输入你的问题（Enter 发送）'
+                '侧边临时会话已就绪\n已带入主会话的近期上下文，仅作参考\n在这里输入你的问题（Enter 发送）'
               )
             : rows,
           running && lastIsUser

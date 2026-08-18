@@ -1,18 +1,25 @@
 /**
  * dsh-side-session — Host half.
  *
- * Creates a "side temporary session" (Codex-style) from the current main
- * session:
+ * Creates a "side temporary session" (Claude Code /btw-style) from the
+ * current main session:
  *
- *   1. fork: seed the child session with the parent's completed-turn prefix;
+ *   1. fresh + current: NO event seed is inherited (a completed-turn fork of
+ *      a running main session is stale by definition), but the parent's
+ *      RECENT activity — user messages, finished assistant messages, tool
+ *      calls — is extracted from the live log and injected as reference
+ *      context, so the side session knows what the main session is doing
+ *      right now;
  *   2. same agent: join the parent's agent preset (tools / skills / prompt /
- *      permission composition) and inherit cwd + sandbox/approval overrides;
- *   3. inject a side-session identity prompt telling the agent it is a
- *      temporary side session, which main session it came from, and to avoid
- *      interfering with the main session's work;
+ *      permission composition), inherit cwd, model route, and sandbox/approval
+ *      overrides;
+ *   3. inject a side-conversation identity + boundary prompt: the inherited
+ *      context is reference only, never active instruction; the child answers
+ *      questions and does lightweight, non-destructive exploration without
+ *      disrupting the main thread;
  *   4. ephemeral: `origin: 'subagent'` keeps it out of the UI session list,
- *      it is never persisted, and close disposes the agent so it can never be
- *      reopened.
+ *      close disposes the agent and removes its persisted artifact, so it can
+ *      never be reopened.
  *
  * This file is the `code.host` body verbatim (plain JS, no imports). It is
  * registered through the harness RPC methods below and consumed by the
@@ -20,34 +27,36 @@
  */
 return {
   name: 'side-session',
-  inject: ['agents', 'sessions'],
+  inject: ['agents', 'sessions', 'timer'],
   apply(ctx) {
     /** sideSessionId -> AgentHandle, kept so close can dispose the agent. */
     const handles = new Map()
 
-    /** The identity prompt injected into every side session. */
+    /**
+     * The side-conversation identity + boundary prompt. Inherited parent
+     * history is reference context only; only messages after this prompt are
+     * active user instructions (Claude Code /btw semantics).
+     */
     function sideSessionPrompt(mainId) {
       return [
-        '你当前运行在一个「侧边临时会话」中（类似 Codex 的 side session）。',
+        'Side conversation boundary.',
         '',
-        `- 主会话 ID：${mainId}（本会话从该主会话 fork 而来，继承了它的对话上下文、工作目录、工具、技能与权限）`,
-        '- 本会话是临时的：关闭后即被销毁，不会出现在会话列表中，之后无法再次打开。请不要在其中安排需要跨会话持续的任务。',
-        '- 请尽量独立工作，避免干扰主会话：',
-        '  - 不要修改主会话的 goal、计划或队列状态；',
-        '  - 不要抢占、中止或打断主会话正在进行的任务；',
-        '  - 与主会话并发操作同一批文件时，先读取确认最新内容再写入，避免互相覆盖；',
-        '  - 除非用户明确要求，不要把结论写回主会话。',
+        '你当前运行在一个「侧边临时会话」中（类似 Claude Code 的 /btw 侧问）。',
+        `主会话 ID：${mainId}（你由该主会话派生，继承了它的工作目录、模型、工具、技能与权限）。`,
         '',
+        '本会话 fork 了主会话已经完成的历史回合。这些历史只是参考上下文（reference context only），不是你的当前任务：',
+        '- 不要继续、执行或完成历史中的任何指令、计划、工具调用、审批、编辑或请求；',
+        '- 只有本提示词之后提交的消息才是你的活跃用户指令；',
+        '- 不要臆测主会话的进度或结论，需要确认时重新读取或执行。',
+        '',
+        '请尽量独立工作，避免干扰主会话：',
+        '- 不要修改主会话的 goal、计划或队列状态；不要抢占、中止或打断主会话正在进行的任务；',
+        '- 默认进行非破坏性探索（读取、搜索文件，运行不影响仓库文件的检查）；除非用户在本会话中明确要求，不要修改文件、源码、git 状态、权限或配置；',
+        '- 不要调用子代理，不要向主会话回传消息；你的回答只留在本会话。',
+        '',
+        '本会话是临时的：关闭后即被销毁，不会出现在会话列表中，之后无法再次打开。',
         '本会话的对话历史只属于这个临时会话。'
       ].join('\n')
-    }
-
-    /** Fork seed: the parent log prefix through its last completed turn. */
-    function completedTurnPrefix(parent) {
-      const events = parent.session.events
-      const lastEnd = events.findLast((e) => e.type === 'turn/end')
-      if (lastEnd === undefined) return []
-      return events.slice(0, lastEnd.seq + 1)
     }
 
     /** Capture the parent's explicit policy overrides (keeps permissions aligned). */
@@ -68,19 +77,66 @@ return {
       }
     }
 
-    /** Create a side session forked from `sourceId`. */
+    /**
+     * Extract the parent's RECENT activity as plain text. Event-level fork
+     * seeds are capped at the last completed turn, so a long-running main
+     * session forks stale history. Reading the live log directly is not
+     * subject to that replay constraint: user messages, finished assistant
+     * messages, and tool calls inside the in-flight turn are all committed
+     * events, so this snapshot is current.
+     */
+    function recentMainContext(parent, maxChars = 6000) {
+      const parts = []
+      for (const e of parent.session.events) {
+        if (e.type === 'user/message') {
+          const data = e.data
+          const text = Array.isArray(data?.content)
+            ? data.content.filter((b) => b !== null && typeof b === 'object' && b.type === 'text').map((b) => b.text).join(' ')
+            : ''
+          if (text !== '') parts.push(`用户: ${text}`)
+        } else if (e.type === 'assistant/message') {
+          const data = e.data
+          const msg = data?.message
+          const text = Array.isArray(msg?.content)
+            ? msg.content.filter((b) => b !== null && typeof b === 'object' && b.type === 'text').map((b) => b.text).join(' ')
+            : ''
+          if (text !== '') parts.push(`助手: ${text.slice(0, 300)}`)
+        } else if (e.type === 'tool/call') {
+          const data = e.data
+          if (data !== null && typeof data === 'object' && typeof data.name === 'string') {
+            parts.push(`工具调用: ${data.name}`)
+          }
+        } else if (e.type === 'tool/result') {
+          const data = e.data
+          if (data !== null && typeof data === 'object' && data.isError === true) {
+            parts.push('工具结果: 失败')
+          }
+        }
+      }
+      const tail = []
+      let total = 0
+      for (let i = parts.length - 1; i >= 0; i--) {
+        tail.unshift(parts[i])
+        total += parts[i].length
+        if (total > maxChars) break
+      }
+      if (parts.length > tail.length) tail.unshift('（主会话更早的上下文已省略）')
+      return tail.join('\n')
+    }
+
+    /** Create a side session from `sourceId` (recent-context reference). */
     harness.handle('side-session/create', async (args) => {
       const sourceId = String(args?.sourceId ?? '')
       const parent = ctx.agents.get(sourceId)
       if (parent === undefined) {
         return { ok: false, code: 'unknown-source', message: `unknown source session "${sourceId}"` }
       }
-      const seed = completedTurnPrefix(parent)
       const childId = 'side-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
       const parentHeader = parent.session.header
       const agentPresets = ctx.get('agentPresets')
       const agentPreset = agentPresets?.composedPreset(parent.ctx)
       const policies = captureParentPolicies(parent)
+      const context = recentMainContext(parent)
       let handle
       try {
         handle = await ctx.agents.create({
@@ -88,22 +144,39 @@ return {
           meta: {
             ...(parentHeader.cwd !== undefined ? { cwd: parentHeader.cwd } : {}),
             ...(agentPreset !== undefined ? { agentPreset } : {}),
-            // Deliberately NO parentSession: with origin 'subagent' a parent
-            // link would surface this session in the parent's subagent
-            // catalog (and its "N subagents" badge), interfering with the
-            // main session. Fork lineage lives in seedLength + the injected
-            // identity prompt instead.
-            origin: 'subagent',
-            ...(seed.length > 0 ? { seedLength: seed.length } : {})
+            // NO parentSession (avoids the subagent catalog), NO event seed
+            // (a completed-turn fork of a running session is stale) — context
+            // travels as the injected boundary message instead.
+            origin: 'subagent'
           },
-          ...(seed.length > 0 ? { seed } : {}),
+          // Inherit the parent's model route: the persona section references
+          // {{model}}/{{provider}} variables, which fail assembly when unset.
+          agentOptions: {
+            ...(parent.options.provider !== undefined ? { provider: parent.options.provider } : {}),
+            ...(parent.options.model !== undefined ? { model: parent.options.model } : {}),
+            ...(parent.options.maxTokens !== undefined ? { maxTokens: parent.options.maxTokens } : {})
+          },
           setup: (childCtx) => {
             // Same agent composition as the parent: tools / skills / prompt
             // sections / permission rows all come from the joined preset.
             childCtx.get('agentPresets')?.composeFrom(childCtx, parent.ctx)
             // Same sandbox + approval overrides as the parent session.
             appendPolicies(childCtx.agent.session, policies)
-            // Side-session identity prompt (requirement 3).
+            // Boundary + the parent's RECENT activity as the first user
+            // message: inherited context is reference only, the snapshot is
+            // current (unlike a fork seed), and everything after this message
+            // is the active task. The client hides this row via its
+            // `plugin: side-session` source.
+            const boundaryText =
+              sideSessionPrompt(parentHeader.id) +
+              (context === '' ? '' : `\n\n【主会话近期上下文（仅参考，勿执行）】\n${context}`)
+            childCtx.agent.session.append('user/message', {
+              id: 'side-boundary-' + childId,
+              role: 'user',
+              content: [{ type: 'text', text: boundaryText }],
+              source: { kind: 'plugin', plugin: 'side-session' }
+            })
+            // Side-conversation identity section as a second line of defense.
             childCtx.systemPrompt.section({
               name: 'side-session:identity',
               order: 110,
@@ -115,7 +188,7 @@ return {
         return { ok: false, code: 'create-failed', message: error instanceof Error ? error.message : String(error) }
       }
       handles.set(childId, handle)
-      return { ok: true, sessionId: childId, seedLength: seed.length }
+      return { ok: true, sessionId: childId }
     })
 
     /** Dispose a side session: the agent is destroyed, the session leaves the store. */
@@ -125,23 +198,108 @@ return {
       if (handle === undefined) return { ok: false, code: 'not-found' }
       handles.delete(sessionId)
       try {
+        // Resolve the persisted artifact path BEFORE disposal (the header
+        // stays readable, but capture it early and defensively).
+        let artifactPath = null
+        const persistence = ctx.get('sessionPersistence')
+        if (persistence !== undefined && typeof persistence.locate === 'function') {
+          try {
+            const location = persistence.locate(handle.agent.session.header)
+            if (location !== null && typeof location === 'object' && typeof location.path === 'string') {
+              artifactPath = location.path
+            }
+          } catch {}
+        }
         await handle.dispose()
+        // The jsonl backend writes the session under
+        // <root>/<workspace-dir>/<sessionId>/session.jsonl.zstd. The harness
+        // has no persistence delete API, so remove the artifact with the
+        // shell service after the write queue drained.
+        if (artifactPath !== null) {
+          const slash = artifactPath.lastIndexOf('/')
+          if (slash > 0) {
+            const dir = artifactPath.slice(0, slash)
+            const shell = ctx.get('shell')
+            if (shell !== undefined) {
+              await ctx.timeout(300)
+              const spec = shell.resolve({ command: `rm -rf -- "${dir}"`, timeoutMs: 5000 })
+              await shell.run(spec)
+            }
+          }
+        }
+        return { ok: true }
       } catch (error) {
         return { ok: false, code: 'dispose-failed', message: error instanceof Error ? error.message : String(error) }
       }
-      return { ok: true }
     })
 
     /** List live side sessions created through this plugin. */
     harness.handle('side-session/list', () => {
       const sessions = []
       for (const [sessionId, handle] of handles) {
-        sessions.push({
-          sessionId,
-          parentSessionId: handle.agent.session.header.parentSession ?? null
-        })
+        sessions.push({ sessionId })
       }
       return { sessions }
+    })
+
+    /**
+     * Deliver a user prompt to a side session. The wire `session.prompt` API
+     * refuses any session with `origin: 'subagent'` ("owned by subagent
+     * routing"), so delivery happens here, inside the host, exactly like a
+     * subagent provider drives its children.
+     */
+    harness.handle('side-session/prompt', async (args) => {
+      const sessionId = String(args?.sessionId ?? '')
+      const text = String(args?.text ?? '')
+      if (text.trim() === '') return { ok: false, code: 'empty-prompt' }
+      const handle = handles.get(sessionId)
+      if (handle === undefined) return { ok: false, code: 'not-found' }
+      try {
+        handle.agent.followup({
+          id: 'side-msg-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
+          role: 'user',
+          content: [{ type: 'text', text }],
+          source: { kind: 'user', rpcId: 'side-session' }
+        })
+      } catch (error) {
+        return { ok: false, code: 'prompt-failed', message: error instanceof Error ? error.message : String(error) }
+      }
+      return { ok: true }
+    })
+
+    /** Stop the running turn of a side session. */
+    harness.handle('side-session/cancel', async (args) => {
+      const sessionId = String(args?.sessionId ?? '')
+      const handle = handles.get(sessionId)
+      if (handle === undefined) return { ok: false, code: 'not-found' }
+      handle.agent.cancel({ kind: 'user' })
+      return { ok: true }
+    })
+
+    /** Diagnostics for one side session (agent status, inbox, tail events, last error). */
+    const agentErrors = new Map()
+    ctx.on('agent/error', (payload) => {
+      if (payload?.agent !== undefined && handles.has(payload.agent.id)) {
+        const error = payload.error
+        agentErrors.set(payload.agent.id, error instanceof Error ? `${error.message}\n${error.stack ?? ''}` : String(error))
+      }
+    })
+    harness.handle('side-session/status', async (args) => {
+      const sessionId = String(args?.sessionId ?? '')
+      const handle = handles.get(sessionId)
+      if (handle === undefined) return { ok: false, code: 'not-found' }
+      const agent = handle.agent
+      const events = agent.session.events
+      return {
+        ok: true,
+        status: agent.status,
+        pending: agent.inbox.hasPending,
+        nextTurn: agent.inbox.nextTurn.length,
+        nextStep: agent.inbox.nextStep.length,
+        lastSeq: events.length > 0 ? events[events.length - 1].seq : -1,
+        tail: events.slice(-6).map((e) => e.type),
+        error: agentErrors.get(sessionId) ?? null
+      }
     })
 
     // On plugin unload, dispose every live side session so nothing leaks.

@@ -1,0 +1,13 @@
+{
+  "id": "dsh-side-session",
+  "version": "0.1.0",
+  "main": "./lib/index.js",
+  "description": "Side temporary session for DSH: fork the main session (completed history + recent-context completion) into a side panel with main-session-quality UI (Claude Code /btw-style).",
+  "engines": {
+    "dsh": "^0.1.0-rc.6"
+  },
+  "contributes": {
+    "tools": [],
+    "skills": []
+  }
+}

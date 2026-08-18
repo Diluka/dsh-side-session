@@ -29,7 +29,9 @@ return {
     const slots = ctx.get('slots')
     if (slots === undefined || sessions === undefined) return
 
-    /** The currently open side session: id plus the fork-seed boundary. */
+    /** The currently open side session. `sessionId` stays null until the
+     *  user sends the first message — the fork + agent creation (the ~1s
+     *  step) happens then, not when the panel opens. */
     let sideState = null
     const listeners = new Set()
     const subscribeSide = (fn) => {
@@ -573,6 +575,7 @@ return {
     /** The floating side-session panel (shell.overlay occupant). */
     function SidePanel() {
       const state = React.useSyncExternalStore(subscribeSide, getSide)
+      const mainId = state === null ? null : state.mainId
       const sessionId = state === null ? null : state.sessionId
       const seedLength = state === null ? null : state.seedLength
       const { session, snapshot } = useSideSession(sessionId)
@@ -585,20 +588,34 @@ return {
         if (el !== null) el.scrollTop = el.scrollHeight
       }, [snapshot])
 
-      if (sessionId === null) return null
+      if (state === null) return null
 
       const running = snapshot?.running === true
       const nodes = snapshot?.nodes ?? []
+      const initialized = sessionId !== null
 
       const send = async () => {
         const text = draft.trim()
-        if (text === '' || sessionId === null || sending) return
+        if (text === '' || sending) return
         setSending(true)
         try {
+          // First message: initialize the side session (fork seed + recent
+          // context + agent creation) now, then deliver the prompt. Later
+          // messages go straight to the existing session.
+          let target = sessionId
+          if (target === null) {
+            const created = await host.call('side-session/create', { sourceId: mainId })
+            if (created === null || created.ok !== true || typeof created.sessionId !== 'string') {
+              console.error('side-session create failed:', created)
+              return
+            }
+            target = created.sessionId
+            setSide({ mainId, sessionId: target, seedLength: typeof created.seedLength === 'number' ? created.seedLength : null })
+          }
           // The wire session.prompt API refuses origin 'subagent' sessions,
           // so prompts go through the host half, which drives the agent
           // directly (side-session/prompt).
-          const result = await host.call('side-session/prompt', { sessionId, text })
+          const result = await host.call('side-session/prompt', { sessionId: target, text })
           if (result !== null && result.ok === true) setDraft('')
           else console.error('side-session send failed:', result)
         } catch (error) {
@@ -609,10 +626,12 @@ return {
       }
 
       const close = async () => {
+        const id = sessionId
         setSide(null)
         setDraft('')
+        if (id === null) return
         try {
-          await host.call('side-session/close', { sessionId })
+          await host.call('side-session/close', { sessionId: id })
         } catch (error) {
           console.error('side-session close failed:', error)
         }
@@ -686,7 +705,9 @@ return {
             ? React.createElement(
                 'div',
                 { className: 'ss-empty' },
-                '侧边临时会话已就绪\n已带入主会话的近期上下文，仅作参考\n在这里输入你的问题（Enter 发送）'
+                initialized
+                  ? '侧边临时会话已就绪\n已带入主会话的近期上下文，仅作参考\n在这里输入你的问题（Enter 发送）'
+                  : '侧边临时会话\n发送第一条消息时初始化（fork 主会话上下文）\n在这里输入你的问题（Enter 发送）'
               )
             : rows,
           running && lastIsUser
@@ -717,11 +738,11 @@ return {
                 send()
               }
             },
-            disabled: session === null || sending
+            disabled: session === null && initialized || sending
           }),
           React.createElement(
             'button',
-            { className: 'ss-send', onClick: send, disabled: session === null || sending || draft.trim() === '' },
+            { className: 'ss-send', onClick: send, disabled: sending || draft.trim() === '' || (session === null && initialized) },
             sending ? '…' : '发送'
           )
         )
@@ -732,29 +753,18 @@ return {
     function ToggleButton(props) {
       const mainId = props.sessionId
       const sideOpen = React.useSyncExternalStore(subscribeSide, getSide)
-      const [busy, setBusy] = React.useState(false)
-      const open = async () => {
-        if (busy || sideOpen !== null || mainId === undefined) return
-        setBusy(true)
-        try {
-          const result = await host.call('side-session/create', { sourceId: mainId })
-          if (result !== null && result.ok === true && typeof result.sessionId === 'string') {
-            setSide({ sessionId: result.sessionId, seedLength: typeof result.seedLength === 'number' ? result.seedLength : null })
-          } else {
-            console.error('side-session create failed:', result)
-          }
-        } catch (error) {
-          console.error('side-session create failed:', error)
-        } finally {
-          setBusy(false)
-        }
+      const open = () => {
+        if (sideOpen !== null || mainId === undefined) return
+        // Opening the panel is instant; the fork + agent creation happens
+        // lazily on the first message (see SidePanel.send).
+        setSide({ mainId, sessionId: null, seedLength: null })
       }
       return React.createElement(
         'button',
         {
           onClick: open,
-          disabled: busy || sideOpen !== null || mainId === undefined,
-          title: busy ? '正在创建…' : (sideOpen !== null ? '侧边会话已打开' : '打开侧边临时会话（fork 当前会话）')
+          disabled: sideOpen !== null || mainId === undefined,
+          title: sideOpen !== null ? '侧边会话已打开' : '打开侧边临时会话（fork 当前会话）'
         },
         '侧边会话'
       )
